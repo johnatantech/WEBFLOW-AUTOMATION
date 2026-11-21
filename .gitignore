@@ -1,0 +1,28 @@
+# Ambiente virtual
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Arquivos de configuração e credenciais
+.env
+.env.*
+!.env.example
+secrets.json
+credentials.json
+
+# Logs
+*.log
+logs/
+
+# VS Code
+.vscode/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+desktop.ini
