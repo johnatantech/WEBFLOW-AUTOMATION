@@ -1,651 +1,230 @@
+"""Painel de controle do robô em Tkinter."""
 
+import os
+import sys
 import tkinter as tk
 from datetime import datetime
-from threading import Thread, Event
-from queue import Queue, Empty
-from playwright.sync_api import sync_playwright
+from queue import Empty, Queue
+from threading import Event, Thread
+from tkinter import ttk
 
-
-# ==========================================
-# CONFIGURACOES
-# ==========================================
+import config
+from config import ConfiguracaoInvalida, carregar_configuracao
+from robo import RoboLogin, Situacao, configurar_log
 
 FUNDO = "#111827"
 PAINEL = "#1F2937"
+BORDA = "#374151"
 AZUL = "#2563EB"
-BRANCO = "#FFFFFF"
+BRANCO = "#F9FAFB"
 CINZA = "#9CA3AF"
 VERDE = "#22C55E"
 VERMELHO = "#EF4444"
+AMARELO = "#F59E0B"
+FONTE = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
 
-DELAY = 1500
-
-fila = Queue()
-cancelar_evento = Event()
-
-executando = False
-total_execucoes = 0
+CORES_SITUACAO = {Situacao.SUCESSO: VERDE, Situacao.FALHA: VERMELHO, Situacao.CANCELADO: AMARELO}
 
 
-# ==========================================
-# JANELA PRINCIPAL
-# ==========================================
+class Painel:
 
-janela = tk.Tk()
-janela.title("WebFlow Automation")
-janela.geometry("1000x680")
-janela.configure(bg=FUNDO)
-janela.minsize(850, 550)
+    def __init__(self, janela):
+        self.janela = janela
+        self.fila = Queue()
+        self.cancelar = Event()
+        self.executando = False
+        self.contagem = {Situacao.SUCESSO: 0, Situacao.FALHA: 0, Situacao.CANCELADO: 0}
+        self.ultima_evidencia = None
 
+        janela.title("WebFlow Automation")
+        janela.geometry("980x700")
+        janela.minsize(860, 600)
+        janela.configure(bg=FUNDO)
 
-# ==========================================
-# FUNCOES AUXILIARES
-# ==========================================
+        self._montar_cabecalho()
+        self._montar_indicadores()
+        self._montar_central()
+        self._carregar_configuracao()
+        self._processar_fila()
 
-def registrar_log(mensagem):
+    # ------------------------------------------------------------ layout
 
-    horario = datetime.now().strftime("%H:%M:%S")
+    def _montar_cabecalho(self):
+        quadro = tk.Frame(self.janela, bg=FUNDO)
+        quadro.pack(fill="x", padx=32, pady=(24, 8))
+        tk.Label(quadro, text="WebFlow Automation", font=(FONTE, 20, "bold"), fg=BRANCO, bg=FUNDO).pack(anchor="w")
+        self.label_alvo = tk.Label(quadro, text="", font=(FONTE, 10), fg=CINZA, bg=FUNDO)
+        self.label_alvo.pack(anchor="w", pady=(2, 0))
 
-    logs.insert(
-        tk.END,
-        f"[{horario}] {mensagem}\n"
-    )
+    def _card(self, pai, titulo):
+        card = tk.Frame(pai, bg=PAINEL, padx=20, pady=14, highlightbackground=BORDA, highlightthickness=1)
+        card.pack(side="left", expand=True, fill="both", padx=6)
+        tk.Label(card, text=titulo, fg=CINZA, bg=PAINEL, font=(FONTE, 10)).pack(anchor="w")
+        valor = tk.Label(card, text="0", fg=BRANCO, bg=PAINEL, font=(FONTE, 22, "bold"))
+        valor.pack(anchor="w", pady=(4, 0))
+        return valor
 
-    logs.see(tk.END)
+    def _montar_indicadores(self):
+        quadro = tk.Frame(self.janela, bg=FUNDO)
+        quadro.pack(fill="x", padx=26, pady=8)
+        self.valor_sucessos = self._card(quadro, "Sucessos")
+        self.valor_falhas = self._card(quadro, "Falhas")
+        self.valor_cancelados = self._card(quadro, "Cancelamentos")
+        self.valor_duracao = self._card(quadro, "Última duração")
+        self.valor_duracao.config(text="-")
 
+    def _montar_central(self):
+        area = tk.Frame(self.janela, bg=PAINEL, padx=24, pady=18, highlightbackground=BORDA, highlightthickness=1)
+        area.pack(fill="both", expand=True, padx=32, pady=(8, 24))
 
-def atualizar_status(mensagem, cor=VERDE):
+        self.status = tk.Label(area, text="", font=(FONTE, 11, "bold"), bg=PAINEL)
+        self.status.pack(anchor="w")
 
-    status.config(
-        text=f"● {mensagem}",
-        fg=cor
-    )
+        estilo = ttk.Style()
+        estilo.theme_use("clam")
+        estilo.configure("Robo.Horizontal.TProgressbar", troughcolor=FUNDO, background=AZUL,
+                         bordercolor=PAINEL, lightcolor=AZUL, darkcolor=AZUL)
+        self.barra = ttk.Progressbar(area, style="Robo.Horizontal.TProgressbar", maximum=len(RoboLogin.ETAPAS))
+        self.barra.pack(fill="x", pady=(10, 4))
+        self.label_etapa = tk.Label(area, text="", font=(FONTE, 9), fg=CINZA, bg=PAINEL)
+        self.label_etapa.pack(anchor="w")
 
+        botoes = tk.Frame(area, bg=PAINEL)
+        botoes.pack(anchor="w", pady=14)
+        self.botao_iniciar = self._botao(botoes, "Iniciar automação", AZUL, self.iniciar)
+        self.botao_cancelar = self._botao(botoes, "Cancelar", VERMELHO, self.cancelar_execucao, estado="disabled")
+        self.botao_evidencia = self._botao(botoes, "Abrir evidência da falha", "#4B5563", self.abrir_evidencia, estado="disabled")
 
-def aguardar(pagina):
+        tk.Label(area, text="Histórico", font=(FONTE, 11, "bold"), fg=BRANCO, bg=PAINEL).pack(anchor="w", pady=(6, 6))
+        self.logs = tk.Text(area, height=10, bg=FUNDO, fg="#D1D5DB", font=("Consolas", 10), relief="flat",
+                            padx=10, pady=10, state="disabled", insertbackground=BRANCO)
+        self.logs.pack(fill="both", expand=True)
+        for situacao, cor in CORES_SITUACAO.items():
+            self.logs.tag_configure(situacao.value, foreground=cor)
 
-    # Espera interrompível pelo usuário
-    if cancelar_evento.wait(DELAY / 1000):
-        raise InterruptedError(
-            "Automacao cancelada pelo usuario."
+    def _botao(self, pai, texto, cor, comando, estado="normal"):
+        botao = tk.Button(pai, text=texto, command=comando, fg=BRANCO, activebackground=cor,
+                          activeforeground=BRANCO, disabledforeground="#6B7280", font=(FONTE, 10, "bold"),
+                          padx=18, pady=9, relief="flat", bd=0, highlightthickness=0)
+        botao.cor = cor
+        botao.pack(side="left", padx=(0, 10))
+        self._habilitar(botao, estado == "normal")
+        return botao
+
+    @staticmethod
+    def _habilitar(botao, ativo, texto=None):
+        """Botão desabilitado fica cinza, para não parecer clicável."""
+        botao.config(state="normal" if ativo else "disabled", bg=botao.cor if ativo else BORDA,
+                     cursor="hand2" if ativo else "arrow")
+        if texto:
+            botao.config(text=texto)
+
+    # ------------------------------------------------------------ ações
+
+    def _carregar_configuracao(self):
+        try:
+            self.cfg = carregar_configuracao()
+            modo = "navegador oculto" if self.cfg.headless else "navegador visível"
+            self.label_alvo.config(text=f"Sistema: {self.cfg.url}  ({modo})")
+            self._status("Pronto para executar", VERDE)
+            self._log("Configuração carregada do .env.")
+        except ConfiguracaoInvalida as erro:
+            self.cfg = None
+            self.label_alvo.config(text="Sem configuração")
+            self._status("Configuração pendente", AMARELO)
+            self._log(str(erro), Situacao.FALHA.value)
+            self._habilitar(self.botao_iniciar, False)
+
+    def iniciar(self):
+        if self.executando or self.cfg is None:
+            return
+        self.executando = True
+        self.cancelar.clear()
+        self.barra["value"] = 0
+        self._habilitar(self.botao_iniciar, False, "Executando...")
+        self._habilitar(self.botao_cancelar, True, "Cancelar")
+        self._habilitar(self.botao_evidencia, False)
+        self._status("Automação em andamento", AZUL)
+        self._log("Execução iniciada.")
+
+        robo = RoboLogin(
+            self.cfg,
+            ao_avancar=lambda i, total, etapa: self.fila.put(("etapa", i, total, etapa)),
+            cancelar=self.cancelar,
         )
-
-
-def verificar_cancelamento():
-
-    if cancelar_evento.is_set():
-        raise InterruptedError(
-            "Automacao cancelada pelo usuario."
-        )
-
-
-# ==========================================
-# AUTOMACAO COM PLAYWRIGHT
-# ==========================================
-
-def executar_robo():
-
-    navegador = None
-    sucesso = False
-    cancelado = False
-
-    try:
-
-        fila.put(("log", "Iniciando Playwright..."))
-
-        with sync_playwright() as p:
-
-            try:
-
-                verificar_cancelamento()
-
-                navegador = p.chromium.launch(
-                    headless=False
-                )
-
-                pagina = navegador.new_page()
-
-                pagina.set_default_timeout(10000)
-
-                fila.put((
-                    "log",
-                    "Navegador iniciado."
-                ))
-
-                aguardar(pagina)
-
-                verificar_cancelamento()
-
-                fila.put((
-                    "log",
-                    "Acessando sistema web..."
-                ))
-
-                pagina.goto(
-                    "https://the-internet.herokuapp.com/login",
-                    wait_until="domcontentloaded",
-                    timeout=20000
-                )
-
-                verificar_cancelamento()
-                aguardar(pagina)
-
-                fila.put((
-                    "log",
-                    "Preenchendo usuario..."
-                ))
-
-                pagina.get_by_label("Username").fill(
-                    "tomsmith"
-                )
-
-                verificar_cancelamento()
-                aguardar(pagina)
-
-                fila.put((
-                    "log",
-                    "Preenchendo senha..."
-                ))
-
-                pagina.get_by_label("Password").fill(
-                    "SuperSecretPassword!"
-                )
-
-                verificar_cancelamento()
-                aguardar(pagina)
-
-                fila.put((
-                    "log",
-                    "Realizando login..."
-                ))
-
-                pagina.get_by_role(
-                    "button",
-                    name="Login"
-                ).click()
-
-                verificar_cancelamento()
-                aguardar(pagina)
-
-                fila.put((
-                    "log",
-                    "Validando resultado..."
-                ))
-
-                mensagem = pagina.locator("#flash")
-
-                mensagem.wait_for(
-                    state="visible"
-                )
-
-                verificar_cancelamento()
-
-                texto = mensagem.inner_text()
-
-                if "You logged into a secure area!" in texto:
-
-                    sucesso = True
-
-                    fila.put((
-                        "log",
-                        "LOGIN REALIZADO COM SUCESSO!"
-                    ))
-
-                    fila.put((
-                        "status",
-                        "Automacao concluida!",
-                        VERDE
-                    ))
-
-                else:
-
-                    raise Exception(
-                        "Login nao confirmado."
-                    )
-
-            finally:
-
-                # Fechar navegador antes de encerrar Playwright
-                if navegador:
-
-                    try:
-
-                        navegador.close()
-
-                        fila.put((
-                            "log",
-                            "Navegador encerrado."
-                        ))
-
-                    except Exception as erro:
-
-                        fila.put((
-                            "log",
-                            f"Erro ao fechar navegador: {erro}"
-                        ))
-
-    except InterruptedError:
-
-        cancelado = True
-
-        fila.put((
-            "log",
-            "Automacao cancelada pelo usuario."
-        ))
-
-        fila.put((
-            "status",
-            "Automacao cancelada",
-            VERMELHO
-        ))
-
-    except Exception as erro:
-
-        fila.put((
-            "log",
-            f"ERRO: {str(erro)}"
-        ))
-
-        fila.put((
-            "status",
-            "Falha na automacao",
-            VERMELHO
-        ))
-
-    finally:
-
-        fila.put((
-            "finished",
-            sucesso,
-            cancelado
-        ))
-
-
-# ==========================================
-# INICIAR AUTOMACAO
-# ==========================================
-
-def iniciar_automacao():
-
-    global executando
-
-    if executando:
-        return
-
-    executando = True
-
-    cancelar_evento.clear()
-
-    botao_iniciar.config(
-        state="disabled",
-        text="EXECUTANDO..."
-    )
-
-    botao_cancelar.config(
-        state="normal",
-        text="CANCELAR AUTOMACAO"
-    )
-
-    atualizar_status(
-        "Automacao em andamento...",
-        AZUL
-    )
-
-    registrar_log(
-        "Solicitacao de automacao recebida."
-    )
-
-    Thread(
-        target=executar_robo,
-        daemon=True
-    ).start()
-
-
-# ==========================================
-# CANCELAR AUTOMACAO
-# ==========================================
-
-def cancelar_automacao():
-
-    if not executando:
-        return
-
-    cancelar_evento.set()
-
-    botao_cancelar.config(
-        state="disabled",
-        text="CANCELANDO..."
-    )
-
-    atualizar_status(
-        "Solicitando cancelamento...",
-        VERMELHO
-    )
-
-    registrar_log(
-        "Solicitacao de cancelamento recebida."
-    )
-
-
-# ==========================================
-# PROCESSAR MENSAGENS DO ROBO
-# ==========================================
-
-def processar_fila():
-
-    global executando, total_execucoes
-
-    try:
-
-        while True:
-
-            mensagem = fila.get_nowait()
-
-            tipo = mensagem[0]
-
-            if tipo == "log":
-
-                registrar_log(mensagem[1])
-
-            elif tipo == "status":
-
-                atualizar_status(
-                    mensagem[1],
-                    mensagem[2]
-                )
-
-            elif tipo == "finished":
-
-                executando = False
-
-                botao_iniciar.config(
-                    state="normal",
-                    text="INICIAR AUTOMACAO"
-                )
-
-                botao_cancelar.config(
-                    state="disabled",
-                    text="CANCELAR AUTOMACAO"
-                )
-
-                total_execucoes += 1
-
-                valor_execucoes.config(
-                    text=f"{total_execucoes:02d}"
-                )
-
-                sucesso = mensagem[1]
-                cancelado = mensagem[2]
-
-                if cancelado:
-
-                    atualizar_status(
-                        "Execucao cancelada",
-                        VERMELHO
-                    )
-
-                elif sucesso:
-
-                    atualizar_status(
-                        "Execucao finalizada com sucesso",
-                        VERDE
-                    )
-
-                else:
-
-                    atualizar_status(
-                        "Execucao finalizada com erro",
-                        VERMELHO
-                    )
-
-    except Empty:
-        pass
-
-    janela.after(
-        100,
-        processar_fila
-    )
-
-
-# ==========================================
-# CABECALHO
-# ==========================================
-
-cabecalho = tk.Frame(
-    janela,
-    bg=FUNDO,
-    pady=20
-)
-
-cabecalho.pack(
-    fill="x",
-    padx=30
-)
-
-tk.Label(
-    cabecalho,
-    text="WEBFLOW AUTOMATION",
-    font=("Arial", 22, "bold"),
-    fg=BRANCO,
-    bg=FUNDO
-).pack(anchor="w")
-
-tk.Label(
-    cabecalho,
-    text="Painel de controle de automacoes RPA",
-    font=("Arial", 11),
-    fg=CINZA,
-    bg=FUNDO
-).pack(
-    anchor="w",
-    pady=5
-)
-
-
-# ==========================================
-# CARDS DE INDICADORES
-# ==========================================
-
-indicadores = tk.Frame(
-    janela,
-    bg=FUNDO
-)
-
-indicadores.pack(
-    fill="x",
-    padx=30,
-    pady=15
-)
-
-
-def criar_card(parent, titulo, valor):
-
-    card = tk.Frame(
-        parent,
-        bg=PAINEL,
-        padx=25,
-        pady=20
-    )
-
-    card.pack(
-        side="left",
-        expand=True,
-        fill="both",
-        padx=8
-    )
-
-    tk.Label(
-        card,
-        text=titulo,
-        fg=CINZA,
-        bg=PAINEL,
-        font=("Arial", 11)
-    ).pack(anchor="w")
-
-    numero = tk.Label(
-        card,
-        text=valor,
-        fg=BRANCO,
-        bg=PAINEL,
-        font=("Arial", 25, "bold")
-    )
-
-    numero.pack(
-        anchor="w",
-        pady=10
-    )
-
-    return numero
-
-
-valor_automacoes = criar_card(
-    indicadores,
-    "AUTOMACOES",
-    "01"
-)
-
-valor_execucoes = criar_card(
-    indicadores,
-    "EXECUCOES",
-    "00"
-)
-
-criar_card(
-    indicadores,
-    "TECNOLOGIA",
-    "RPA"
-)
-
-
-# ==========================================
-# AREA CENTRAL
-# ==========================================
-
-area = tk.Frame(
-    janela,
-    bg=PAINEL,
-    padx=25,
-    pady=20
-)
-
-area.pack(
-    fill="both",
-    expand=True,
-    padx=38,
-    pady=15
-)
-
-tk.Label(
-    area,
-    text="Central de execucao",
-    font=("Arial", 16, "bold"),
-    fg=BRANCO,
-    bg=PAINEL
-).pack(anchor="w")
-
-
-status = tk.Label(
-    area,
-    text="● Sistema pronto para executar",
-    fg=VERDE,
-    bg=PAINEL,
-    font=("Arial", 11)
-)
-
-status.pack(
-    anchor="w",
-    pady=15
-)
-
-
-# ==========================================
-# BOTOES
-# ==========================================
-
-botao_iniciar = tk.Button(
-    area,
-    text="INICIAR AUTOMACAO",
-    command=iniciar_automacao,
-    bg=AZUL,
-    fg=BRANCO,
-    font=("Arial", 11, "bold"),
-    padx=20,
-    pady=12,
-    relief="flat",
-    cursor="hand2"
-)
-
-botao_iniciar.pack(
-    anchor="w",
-    pady=10
-)
-
-
-botao_cancelar = tk.Button(
-    area,
-    text="CANCELAR AUTOMACAO",
-    command=cancelar_automacao,
-    bg=VERMELHO,
-    fg=BRANCO,
-    font=("Arial", 10, "bold"),
-    padx=20,
-    pady=12,
-    relief="flat",
-    cursor="hand2",
-    state="disabled"
-)
-
-botao_cancelar.pack(
-    anchor="w",
-    pady=10
-)
-
-
-# ==========================================
-# AREA DE LOGS
-# ==========================================
-
-tk.Label(
-    area,
-    text="Historico de atividades",
-    font=("Arial", 13, "bold"),
-    fg=BRANCO,
-    bg=PAINEL
-).pack(
-    anchor="w",
-    pady=(25, 10)
-)
-
-
-logs = tk.Text(
-    area,
-    height=10,
-    bg="#0B1220",
-    fg="#4ADE80",
-    font=("Consolas", 10),
-    relief="flat",
-    padx=10,
-    pady=10
-)
-
-logs.pack(
-    fill="both",
-    expand=True
-)
-
-
-# ==========================================
-# INICIALIZACAO
-# ==========================================
-
-registrar_log(
-    "WebFlow Automation inicializado."
-)
-
-registrar_log(
-    "Aguardando comando do usuario."
-)
-
-processar_fila()
-
-janela.mainloop()
+        # O robô roda fora da thread da interface; a comunicação é só pela fila
+        Thread(target=lambda: self.fila.put(("fim", robo.executar())), daemon=True).start()
+
+    def cancelar_execucao(self):
+        if self.executando:
+            self.cancelar.set()
+            self._habilitar(self.botao_cancelar, False, "Cancelando...")
+            self._status("Cancelando...", AMARELO)
+
+    def abrir_evidencia(self):
+        if not self.ultima_evidencia or not os.path.exists(self.ultima_evidencia):
+            return
+        if sys.platform.startswith("win"):
+            os.startfile(self.ultima_evidencia)
+        elif sys.platform == "darwin":
+            os.system(f'open "{self.ultima_evidencia}"')
+        else:
+            os.system(f'xdg-open "{self.ultima_evidencia}"')
+
+    # ------------------------------------------------------------ fila (thread da interface)
+
+    def _processar_fila(self):
+        try:
+            while True:
+                mensagem = self.fila.get_nowait()
+                if mensagem[0] == "etapa":
+                    _, indice, total, etapa = mensagem
+                    self.barra["value"] = indice
+                    self.label_etapa.config(text=f"Etapa {indice + 1} de {total}: {etapa}")
+                    self._log(etapa)
+                elif mensagem[0] == "fim":
+                    self._finalizar(mensagem[1])
+        except Empty:
+            pass
+        self.janela.after(100, self._processar_fila)
+
+    def _finalizar(self, resultado):
+        self.executando = False
+        self.contagem[resultado.situacao] += 1
+        self.valor_sucessos.config(text=self.contagem[Situacao.SUCESSO])
+        self.valor_falhas.config(text=self.contagem[Situacao.FALHA])
+        self.valor_cancelados.config(text=self.contagem[Situacao.CANCELADO])
+        self.valor_duracao.config(text=f"{resultado.duracao_s:.1f} s")
+
+        if resultado.situacao == Situacao.SUCESSO:
+            self.barra["value"] = len(RoboLogin.ETAPAS)
+
+        cor = CORES_SITUACAO[resultado.situacao]
+        self._status(resultado.mensagem, cor)
+        self._log(resultado.mensagem, resultado.situacao.value)
+
+        self.ultima_evidencia = resultado.evidencia
+        if resultado.evidencia:
+            self._log(f"Evidência: {resultado.evidencia}")
+        self._habilitar(self.botao_evidencia, bool(resultado.evidencia))
+
+        self._habilitar(self.botao_iniciar, True, "Iniciar automação")
+        self._habilitar(self.botao_cancelar, False, "Cancelar")
+
+    # ------------------------------------------------------------ utilitários
+
+    def _status(self, texto, cor):
+        self.status.config(text=f"● {texto}", fg=cor)
+
+    def _log(self, texto, tag=None):
+        self.logs.config(state="normal")
+        self.logs.insert(tk.END, f"[{datetime.now():%H:%M:%S}] {texto}\n", tag)
+        self.logs.see(tk.END)
+        self.logs.config(state="disabled")
+
+
+if __name__ == "__main__":
+    configurar_log()
+    raiz = tk.Tk()
+    Painel(raiz)
+    raiz.mainloop()

@@ -1,79 +1,38 @@
+"""Execução do robô pela linha de comando (útil para agendamento)."""
 
-from playwright.sync_api import sync_playwright, expect
+import argparse
+import sys
+from dataclasses import replace
 
-def executar_robo():
+from config import ConfiguracaoInvalida, carregar_configuracao
+from robo import RoboLogin, Situacao, configurar_log
 
-    navegador = None
 
-    print("===================================")
-    print("       WEBFLOW AUTOMATION")
-    print("       ROBÔ DE LOGIN WEB")
-    print("===================================")
+def main():
+    parser = argparse.ArgumentParser(description="Robô de login web com Playwright.")
+    parser.add_argument("--headless", action="store_true", help="executa sem abrir a janela do navegador")
+    args = parser.parse_args()
 
+    configurar_log()
     try:
-        with sync_playwright() as p:
+        cfg = carregar_configuracao()
+    except ConfiguracaoInvalida as erro:
+        print(f"Configuração inválida: {erro}")
+        return 2
 
-            # 1. Iniciar navegador
-            navegador = p.chromium.launch(
-                headless=False
-            )
+    if args.headless:
+        cfg = replace(cfg, headless=True)
 
-            # 2. Criar uma nova página
-            pagina = navegador.new_page()
+    resultado = RoboLogin(cfg).executar()
 
-            print("\n[1] Acessando sistema...")
+    print(f"\nResultado: {resultado.situacao.value.upper()} em {resultado.duracao_s:.1f} s")
+    print(resultado.mensagem)
+    if resultado.evidencia:
+        print(f"Evidência: {resultado.evidencia}")
 
-            pagina.goto(
-                "https://the-internet.herokuapp.com/login"
-            )
-
-            print("[2] Preenchendo usuário...")
-
-            pagina.get_by_label("Username").fill("tomsmith")
-
-            print("[3] Preenchendo senha...")
-
-            pagina.get_by_label("Password").fill(
-                "SuperSecretPassword!"
-            )
-
-            print("[4] Realizando login...")
-
-            pagina.get_by_role(
-                "button",
-                name="Login"
-            ).click()
-
-            print("[5] Verificando resultado...")
-
-            # 3. Validar login
-            expect(
-                pagina.locator("#flash")
-            ).to_contain_text(
-                "You logged into a secure area!"
-            )
-
-            print("\n===================================")
-            print("       LOGIN REALIZADO!")
-            print("       AUTOMACAO CONCLUIDA")
-            print("===================================")
-
-    except Exception as erro:
-
-        print("\nERRO NA AUTOMACAO!")
-        print(f"Detalhes: {erro}")
-
-        raise
-
-    finally:
-
-        # 4. Encerramento automático
-        if navegador and navegador.is_connected():
-            navegador.close()
-
-        print("\nNavegador encerrado.")
-        print("WebFlow Automation finalizada.")
+    # Código de saída permite que agendadores identifiquem falhas
+    return 0 if resultado.situacao == Situacao.SUCESSO else 1
 
 
 if __name__ == "__main__":
-    executar_robo()
+    sys.exit(main())

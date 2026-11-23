@@ -6,18 +6,18 @@ env/
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
+.pytest_cache/
 
-# Arquivos de configuração e credenciais
+# Credenciais e configuração local
 .env
 .env.*
 !.env.example
 secrets.json
 credentials.json
 
-# Logs
-*.log
+# Saídas da automação
 logs/
+evidencias/
 
 # VS Code
 .vscode/
